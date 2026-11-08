@@ -551,6 +551,9 @@ thread_local! {
     /// not act on the person's keys).
     static SHOWN_COPIES: RefCell<std::collections::HashSet<u64>> = RefCell::new(std::collections::HashSet::new());
     static LIVE_READS: RefCell<HashMap<u64, Weak<RefCell<LiveReads>>>> = RefCell::new(HashMap::new());
+    /// Each copy's programs (`spawn`). The window stops them: the default policy
+    /// keeps the newest copy's module after it closes, and a reload keeps it too.
+    static PROGRAMS: RefCell<HashMap<u64, Weak<RefCell<crate::mod_process::Processes>>>> = RefCell::new(HashMap::new());
     static REVISIONS: RefCell<HashMap<&'static str, u64>> = RefCell::new(HashMap::new());
     static COPY_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static OVERLAY_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -691,6 +694,38 @@ pub fn send_command_to(copy: u64, command: &str) -> bool {
         c.retain(|(_, _, tx)| !tx.is_closed());
         c.iter().any(|(id, _, tx)| *id == copy && tx.try_send(command.to_owned()).is_ok())
     })
+}
+
+fn programs(copy: u64) -> Option<Rc<RefCell<crate::mod_process::Processes>>> {
+    PROGRAMS.with_borrow(|p| p.get(&copy).and_then(Weak::upgrade))
+}
+
+/// Stops what a closed copy started, once its close() is done with it.
+pub fn stop_programs(copy: u64) {
+    if let Some(p) = programs(copy) {
+        p.borrow_mut().kill_all();
+    }
+}
+
+/// At quit, where no copy's module is dropped.
+pub fn stop_all_programs() {
+    for p in PROGRAMS.with_borrow(|p| p.values().filter_map(Weak::upgrade).collect::<Vec<_>>()) {
+        p.borrow_mut().kill_all();
+    }
+}
+
+/// Reloads a copy's code; once that works, the programs the old code started stop.
+pub fn reload<T, E>(copy: u64, reload: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    let old = programs(copy).map(|p| p.borrow().ids()).unwrap_or_default();
+    let reloaded = reload();
+    if reloaded.is_ok()
+        && let Some(p) = programs(copy)
+    {
+        for id in old {
+            p.borrow_mut().kill(id);
+        }
+    }
+    reloaded
 }
 
 /// The copies on screen now (`prepare_load` numbers them).
@@ -910,11 +945,63 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         commands.retain(|(_, _, tx)| !tx.is_closed());
         commands.push((copy, inst.name.clone(), cmd_tx));
     });
+    let processes = Rc::new(RefCell::new(crate::mod_process::Processes::default()));
+    PROGRAMS.with_borrow_mut(|copies| {
+        copies.retain(|_, p| p.strong_count() > 0);
+        copies.insert(copy, Rc::downgrade(&processes));
+    });
+    let process = |a: &gpui_shell::HostArguments| a.number(0).map(|n| n as u64);
     HostModule::new("herdr")
         .declarations(DECLARATIONS)
         .async_function("exec", |a| {
             let command = a.string(0)?.to_owned();
             Ok(exec_future(command, strings(a.get(1)), opt_str(a.get(2), "cwd"), opt_str(a.get(2), "on"), exec_limit(a.get(2))?))
+        })
+        .function("spawn", {
+            let processes = processes.clone();
+            move |a| {
+                if opt_str(a.get(2), "on").is_some() {
+                    return Err(HostError::new("spawn runs programs on this machine only"));
+                }
+                let cwd = opt_str(a.get(2), "cwd").map(PathBuf::from).unwrap_or_else(home);
+                let id = processes.borrow_mut().start(a.string(0)?, &strings(a.get(1)), cwd).map_err(HostError::new)?;
+                Ok((id as f64).into())
+            }
+        })
+        .async_function("processWrite", {
+            let processes = processes.clone();
+            move |a| {
+                let written = processes.borrow().write(process(a)?, a.string(1)?.to_owned()).map_err(HostError::new)?;
+                Ok(async move { written.await.map(|()| HostValue::Null).map_err(HostError::new) })
+            }
+        })
+        .function("processEnd", {
+            let processes = processes.clone();
+            move |a| {
+                processes.borrow().end(process(a)?).map_err(HostError::new)?;
+                Ok(HostValue::Null)
+            }
+        })
+        .async_function("processNextLine", {
+            let processes = processes.clone();
+            move |a| {
+                let line = processes.borrow().next_line(process(a)?).map_err(HostError::new)?;
+                Ok(async move { Ok(line.await.map_or(HostValue::Null, HostValue::Str)) })
+            }
+        })
+        .async_function("processExited", {
+            let processes = processes.clone();
+            move |a| {
+                let exited = processes.borrow().exited(process(a)?).map_err(HostError::new)?;
+                Ok(async move {
+                    let exit = exited.await;
+                    Ok(HostObject::new().field("code", exit.code.map_or(HostValue::Null, |c| (c as f64).into())).field("stderr", exit.stderr).into())
+                })
+            }
+        })
+        .function("processKill", move |a| {
+            processes.borrow_mut().kill(process(a)?);
+            Ok(HostValue::Null)
         })
         .async_function("readTextFile", |a| {
             let path = a.string(0)?.to_owned();
@@ -1278,6 +1365,23 @@ mod tests {
             assert!(!snapshot_changed(1));
             drop(reads);
             assert!(!snapshot_changed(1));
+        }).join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reload_stops_only_what_the_old_code_started() {
+        std::thread::spawn(|| {
+            let p = Rc::new(RefCell::new(crate::mod_process::Processes::default()));
+            PROGRAMS.with_borrow_mut(|copies| { copies.insert(7, Rc::downgrade(&p)); });
+            let start = || p.borrow_mut().start("cat", &[], std::env::temp_dir()).unwrap();
+            let old = start();
+            assert!(reload(7, || Err::<(), ()>(())).is_err());
+            assert_eq!(p.borrow().ids(), [old]);
+            let new = reload(7, || Ok::<_, ()>(start())).unwrap();
+            assert_eq!(p.borrow().ids(), [new]);
+            stop_programs(7);
+            assert!(p.borrow().ids().is_empty());
         }).join().unwrap();
     }
 

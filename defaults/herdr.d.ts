@@ -13,6 +13,34 @@ export interface ExecResult {
  *  Rejects when it can't start (not installed, no such folder, the machine is unreachable). */
 export function exec(command: string, args?: string[], options?: { cwd?: string; on?: string | null; timeout?: number }): Promise<ExecResult>;
 
+export interface ProcessExit {
+  /** null when a signal ended it. */
+  code: number | null;
+  /** The last 64 KiB. */
+  stderr: string;
+}
+
+/** Starts a program the mod keeps talking to, like exec but with no time limit. It and
+ *  everything it starts stop when this copy of the mod closes or reloads; what it
+ *  started also stops when it exits.
+ *  Returns its id for the process* functions. This machine only: `on` throws.
+ *  Throws when it can't start (not installed, no such folder).
+ *    const p = spawn("my-server", ["--stdio"]);
+ *    cx.spawn(async (cx) => { for (let l; (l = await processNextLine(p)) != null;) { ...; cx.notify(); } });
+ */
+export function spawn(command: string, args?: string[], options?: { cwd?: string; on?: string | null }): number;
+/** Writes UTF-8 text to the program's stdin; resolves once written. Rejects once stdin is closed. */
+export function processWrite(id: number, text: string): Promise<null>;
+/** Closes the program's stdin after what was written before. */
+export function processEnd(id: number): null;
+/** The program's next stdout line without the newline, or null once stdout closes.
+ *  Lines over 8 MiB are cut. A program 256 lines ahead of the mod waits for it to read. */
+export function processNextLine(id: number): Promise<string | null>;
+/** Resolves when the program exits. */
+export function processExited(id: number): Promise<ProcessExit>;
+/** Stops the program and everything it started; the other process* functions then refuse its id. */
+export function processKill(id: number): null;
+
 /** Runs `hc` (herdr-core) with the given arguments. Add "--json" for machine output. */
 export function hc(args: string[]): Promise<ExecResult>;
 

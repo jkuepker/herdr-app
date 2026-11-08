@@ -152,8 +152,16 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
     module = module.async_function("feedbackPickImages", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("knownAgents", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("pickFolder", |_| Ok(async { Ok(HostValue::Null) }));
-    for name in ["nextCommand", "watchFolder"] {
+    for name in ["nextCommand", "watchFolder", "processWrite", "processNextLine", "processExited"] {
         module = module.async_function(name, |_| Ok(std::future::pending::<gpui_shell::HostResult>()));
+    }
+    // No shipped mod starts programs.
+    for name in ["spawn", "processEnd", "processKill"] {
+        let calls = calls.clone();
+        module = module.function(name, move |_| {
+            calls.borrow_mut().unexpected.push(format!("unexpected {name}"));
+            Err(HostError::new(format!("unexpected {name}")))
+        });
     }
     for name in ["exec", "hc", "readTextFile", "writeTextFile", "sendFeedback"] {
         let calls = calls.clone();

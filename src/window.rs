@@ -1300,10 +1300,17 @@ impl AppWindow {
     }
 
     fn remove_copy(&mut self, slot: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(copy) = self.copies.remove(slot)
-            && let (Some(runtime), Some(root)) = (&self.runtime, copy.root)
-        {
-            runtime.close(&root, std::time::Instant::now() + Duration::from_millis(250), window, cx).detach();
+        let Some(copy) = self.copies.remove(slot) else { return };
+        let id = copy.id;
+        if let (Some(runtime), Some(root)) = (&self.runtime, copy.root) {
+            let closed = runtime.close(&root, std::time::Instant::now() + Duration::from_millis(250), window, cx);
+            cx.spawn(async move |_, _| {
+                closed.await;
+                mods::stop_programs(id);
+            })
+            .detach();
+        } else {
+            mods::stop_programs(id);
         }
     }
 
@@ -1314,6 +1321,7 @@ impl AppWindow {
                 runtime.close_now(root, deadline, window, cx);
             }
         });
+        mods::stop_all_programs();
     }
 
     fn shows_tab(&self) -> bool {
@@ -3895,7 +3903,7 @@ impl AppWindow {
         let Some(runtime) = self.runtime.clone() else { return };
         for copy in self.copies.values_mut().filter(|c| edited.contains(&c.inst.name) && loaded.contains(&c.id)) {
             let Some(root) = &copy.root else { continue };
-            let error = runtime.reload_now(root, window, cx).err().map(|e| format!("{e:#}"));
+            let error = mods::reload(copy.id, || runtime.reload_now(root, window, cx)).err().map(|e| format!("{e:#}"));
             if let Some(e) = &error {
                 tracing::warn!("mod reload failed: {e}");
             }
